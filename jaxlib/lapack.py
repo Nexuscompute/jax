@@ -1,4 +1,4 @@
-# Copyright 2018 Google LLC
+# Copyright 2018 The JAX Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,648 +15,640 @@
 # Shims that allow the XLA CPU backend to call scipy-provided LAPACK kernels
 # via CustomCallWithLayout.
 
+from collections.abc import Sequence
+from enum import Enum
+from typing import Optional
+
 import numpy as np
+
+import jaxlib.mlir.ir as ir  # pylint: disable=consider-using-from-import
+import jaxlib.mlir.dialects.stablehlo as hlo
+
 from jaxlib import xla_client
 
-from . import _lapack
+from .cpu import _lapack
+from .cpu._lapack import schur
+from .cpu._lapack import eig
+from .hlo_helpers import (
+    custom_call, hlo_u8, hlo_s32,
+    ensure_hlo_s32, hlo_add,
+    DimensionSize, ShapeTypePair, mk_result_types_and_shapes,
+)
+
 for _name, _value in _lapack.registrations().items():
-  xla_client.register_custom_call_target(_name, _value, platform="cpu")
+  xla_client.register_custom_call_target(
+      _name,
+      _value,
+      platform="cpu",
+      api_version=(1 if _name.endswith("_ffi") else 0),
+  )
 
-_ops = xla_client.ops
 
-Shape = xla_client.Shape
+def _char_attr(c):
+  return ir.IntegerAttr.get(ir.IntegerType.get_unsigned(8), ord(c))
 
 
-def _constant_s32_scalar(c, x):
-  return _ops.Constant(c, np.int32(x))
+def _lapack_int_attr(value):
+  return ir.IntegerAttr.get(ir.IntegerType.get_signless(32), value)
+
+
+def _enum_to_char_attr(e: Enum):
+  return ir.IntegerAttr.get(ir.IntegerType.get_unsigned(8), e.value)
+
+
+def _matrix_side_attr(*, left_side: bool):
+  return _char_attr("L" if left_side else "R")
+
+
+def _matrix_uplo_attr(*, lower: bool):
+  return _char_attr("L" if lower else "U")
+
+
+def _matrix_transpose_attr(*, transpose: bool, conjugate: bool):
+  return _char_attr(("C" if conjugate else "T") if transpose else "N")
+
+
+def _matrix_diagonal_attr(*, unit_diag: bool):
+  return _char_attr("U" if unit_diag else "N")
+
+
+def _svd_computation_attr(
+    *, compute_uv: bool, full_matrices: Optional[bool] = True
+):
+  mode = "A"
+  if full_matrices is None:
+    full_matrices = True
+  if not compute_uv:
+    # We should assert that `full_matrices` is never True here.
+    # This should never happen because `full_matrices` can only be computed when
+    # `compute_uv` is True. However, at this point there are too many tests that
+    # rely on this behavior.
+    mode = "N"
+  elif not full_matrices:
+    mode = "S"
+  return _char_attr(mode)
+
+
+LAPACK_DTYPE_PREFIX = {
+    np.float32: "s",
+    np.float64: "d",
+    np.complex64: "c",
+    np.complex128: "z",
+}
+
+
+def prepare_lapack_call(fn_base, dtype):
+  """Initializes the LAPACK library and returns the LAPACK target name."""
+  _lapack.initialize()
+  return build_lapack_fn_target(fn_base, dtype)
+
+
+def build_lapack_fn_target(fn_base: str, dtype) -> str:
+  """Builds the target name for a LAPACK function custom call."""
+  try:
+    prefix = (
+        LAPACK_DTYPE_PREFIX.get(dtype, None) or LAPACK_DTYPE_PREFIX[dtype.type]
+    )
+    return f"lapack_{prefix}{fn_base}"
+  except KeyError as err:
+    raise NotImplementedError(err, f"Unsupported dtype {dtype}.") from err
+
 
 # TODO(phawkins): it would be nice to avoid duplicating code for each type.
 
 # ?trsm(left_side, lower, trans_a, diag, m, n, alpha, a, b):
 # triangular solve
-
-def trsm(c, alpha, a, b, left_side=False, lower=False, trans_a=False,
-         conj_a=False, diag=False):
-  a_shape = c.get_shape(a)
-  b_shape = c.get_shape(b)
-  dtype = b_shape.element_type()
-
-  dims = b_shape.dimensions()
-
-  m, n = dims[-2:]
-  k = m if left_side else n
-
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  num_b = 1
-  for d in batch_dims:
-    num_b *= d
-
-  if batch_dims + (k, k) != a_shape.dimensions() or a_shape.element_type() != dtype:
-    raise ValueError("Argument mismatch for trsm, got {} and {}".format(
-      a_shape, b_shape))
-
-  if dtype == np.float32:
-    fn = b"blas_strsm"
-  elif dtype == np.float64:
-    fn = b"blas_dtrsm"
-  elif dtype == np.complex64:
-    fn = b"blas_ctrsm"
-  elif dtype == np.complex128:
-    fn = b"blas_ztrsm"
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-
+def trsm_hlo(ctx, dtype, alpha, a, b,
+             left_side=False, lower=False, trans_a=False,
+             conj_a=False, diag=False, *,
+             b_shape_vals: tuple[DimensionSize, ...]):
   if conj_a and not trans_a:
     raise NotImplementedError("Conjugation without transposition not supported")
+  fn_base = prepare_lapack_call(fn_base="trsm", dtype=dtype)
+  b_type = ir.RankedTensorType(b.type)
 
+  batch_dims_vals = b_shape_vals[:-2]
+  num_bd = len(batch_dims_vals)
+  scalar_layout = []
   layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
-  return _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(
-      _constant_s32_scalar(c, int(left_side)),
-      _constant_s32_scalar(c, int(lower)),
-      _constant_s32_scalar(c, (2 if conj_a else 1) if trans_a else 0),
-      _constant_s32_scalar(c, int(diag)),
-      _constant_s32_scalar(c, m),
-      _constant_s32_scalar(c, n),
-      _constant_s32_scalar(c, num_b),
-      alpha, a, b),
-    shape_with_layout=Shape.array_shape(dtype, b_shape.dimensions(), layout),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(dtype, (), ()),
-        Shape.array_shape(dtype, a_shape.dimensions(), layout),
-        Shape.array_shape(dtype, b_shape.dimensions(), layout),
-    ))
-jax_trsm = trsm
+  result_types, result_shapes = mk_result_types_and_shapes(
+      [(b_shape_vals, b_type.element_type)])
 
-# # ?getrf: LU decomposition
+  if ctx.is_forward_compat():
+    # The old TRSM kernel name is prefixed with "blas"
+    fn = fn_base.replace("lapack", "blas", 1)
+    m, n = b_shape_vals[-2:]
+    batch_size_val = hlo_s32(1)
+    for b_v in batch_dims_vals:
+      batch_size_val = hlo.multiply(batch_size_val, ensure_hlo_s32(b_v))
+    result_types, result_shapes = mk_result_types_and_shapes(
+        [(b_shape_vals, b_type.element_type)]
+    )
+    return custom_call(
+        fn,
+        result_types=result_types,
+        operands=[hlo_s32(int(left_side)), hlo_s32(int(lower)),
+                  hlo_s32((2 if conj_a else 1) if trans_a else 0), hlo_s32(int(diag)),
+                  ensure_hlo_s32(m), ensure_hlo_s32(n), batch_size_val,
+                  alpha, a, b],
+        operand_layouts=[scalar_layout] * 8 + [layout] * 2,
+        result_layouts=[layout],
+        operand_output_aliases={9: 0},
+        result_shapes=result_shapes,
+    ).results
 
-def getrf(c, a):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
-
-  if dtype == np.float32:
-    fn = b"lapack_sgetrf"
-  elif dtype == np.float64:
-    fn = b"lapack_dgetrf"
-  elif dtype == np.complex64:
-    fn = b"lapack_cgetrf"
-  elif dtype == np.complex128:
-    fn = b"lapack_zgetrf"
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(
-      _constant_s32_scalar(c, b),
-      _constant_s32_scalar(c, m),
-      _constant_s32_scalar(c, n),
-      a),
-    shape_with_layout=Shape.tuple_shape((
-        Shape.array_shape(
-          dtype,
-          batch_dims + (m, n),
-          (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))),
-        Shape.array_shape(
-          np.dtype(np.int32),
-          batch_dims + (min(m, n),),
-          tuple(range(num_bd, -1, -1))),
-        Shape.array_shape(np.dtype(np.int32), batch_dims,
-          tuple(range(num_bd - 1, -1, -1))),
-    )),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(
-          dtype,
-          batch_dims + (m, n),
-          (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))),
-    ))
-  return tuple(_ops.GetTupleElement(out, i) for i in range(3))
-
-# # ?geqrf: QR decomposition
-
-def geqrf(c, a):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
-
-  if dtype == np.float32:
-    fn = b"lapack_sgeqrf"
-    lwork = _lapack.lapack_sgeqrf_workspace(m, n)
-  elif dtype == np.float64:
-    fn = b"lapack_dgeqrf"
-    lwork = _lapack.lapack_dgeqrf_workspace(m, n)
-  elif dtype == np.complex64:
-    fn = b"lapack_cgeqrf"
-    lwork = _lapack.lapack_cgeqrf_workspace(m, n)
-  elif dtype == np.complex128:
-    fn = b"lapack_zgeqrf"
-    lwork = _lapack.lapack_zgeqrf_workspace(m, n)
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(
-      _constant_s32_scalar(c, b),
-      _constant_s32_scalar(c, m),
-      _constant_s32_scalar(c, n),
-      _constant_s32_scalar(c, lwork),
-      a,
-    ),
-    shape_with_layout=Shape.tuple_shape((
-        Shape.array_shape(
-          dtype,
-          batch_dims + (m, n),
-          (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))),
-        Shape.array_shape(
-          np.dtype(dtype),
-          batch_dims + (min(m, n),),
-          tuple(range(num_bd, -1, -1))),
-        Shape.array_shape(np.dtype(np.int32), batch_dims,
-          tuple(range(num_bd - 1, -1, -1))),
-        Shape.array_shape(np.dtype(dtype), (lwork,), (0,)),
-    )),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(
-          dtype,
-          batch_dims + (m, n),
-          (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))),
-    ))
-  return tuple(_ops.GetTupleElement(out, i) for i in range(3))
-
-# # ?orgqr: product of elementary Householder reflectors:
-
-def orgqr(c, a, tau):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
-
-  tau_dims = c.get_shape(tau).dimensions()
-  assert tau_dims[:-1] == dims[:-2]
-  k = tau_dims[-1]
-
-  if dtype == np.float32:
-    fn = b"lapack_sorgqr"
-    lwork = _lapack.lapack_sorgqr_workspace(m, n, k)
-  elif dtype == np.float64:
-    fn = b"lapack_dorgqr"
-    lwork = _lapack.lapack_dorgqr_workspace(m, n, k)
-  elif dtype == np.complex64:
-    fn = b"lapack_cungqr"
-    lwork = _lapack.lapack_cungqr_workspace(m, n, k)
-  elif dtype == np.complex128:
-    fn = b"lapack_zungqr"
-    lwork = _lapack.lapack_zungqr_workspace(m, n, k)
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(
-      _constant_s32_scalar(c, b),
-      _constant_s32_scalar(c, m),
-      _constant_s32_scalar(c, n),
-      _constant_s32_scalar(c, k),
-      _constant_s32_scalar(c, lwork),
-      a,
-      tau,
-    ),
-    shape_with_layout=Shape.tuple_shape((
-        Shape.array_shape(
-          dtype,
-          batch_dims + (m, n),
-          (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))),
-        Shape.array_shape(np.dtype(np.int32), batch_dims,
-          tuple(range(num_bd - 1, -1, -1))),
-        Shape.array_shape(dtype, (lwork,), (0,)),
-    )),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(
-          dtype,
-          batch_dims + (m, n),
-          (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))),
-        Shape.array_shape(
-          dtype,
-          batch_dims + (k,),
-          tuple(range(num_bd, -1, -1))),
-    ))
-  return tuple(_ops.GetTupleElement(out, i) for i in range(2))
+  fn = fn_base + "_ffi"
+  return custom_call(
+      fn,
+      result_types=result_types,
+      operands=[a, b, alpha],
+      operand_layouts=[layout] * 2 + [scalar_layout],
+      result_layouts=[layout],
+      operand_output_aliases={1: 0},
+      result_shapes=result_shapes,
+      backend_config={
+          "side": _matrix_side_attr(left_side=left_side),
+          "uplo": _matrix_uplo_attr(lower=lower),
+          "trans_x": _matrix_transpose_attr(
+              transpose=trans_a, conjugate=conj_a
+          ),
+          "diag": _matrix_diagonal_attr(unit_diag=diag),
+      },
+      api_version=4,
+  ).results
 
 
 # ?potrf: Cholesky decomposition
 
-def potrf(c, a, lower=False):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  m, n = dims[-2:]
-  if m != n:
-    raise ValueError("potrf expects a square matrix, got {}".format(a_shape))
-  if dtype == np.float32:
-    fn = b"lapack_spotrf"
-  elif dtype == np.float64:
-    fn = b"lapack_dpotrf"
-  elif dtype == np.complex64:
-    fn = b"lapack_cpotrf"
-  elif dtype == np.complex128:
-    fn = b"lapack_zpotrf"
+def potrf_hlo(ctx, dtype, a: ir.Value, *, lower=False,
+              a_shape_vals: tuple[DimensionSize, ...]):
+  a_type = ir.RankedTensorType(a.type)
+  fn_base = prepare_lapack_call(fn_base="potrf", dtype=dtype)
+  batch_dims_vals = a_shape_vals[:-2]
+  num_bd = len(batch_dims_vals)
+  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
+  info_layout = tuple(range(num_bd - 1, -1, -1))
+
+  shape_type_pairs: Sequence[ShapeTypePair] = [
+      (a_shape_vals, a_type.element_type),
+      (batch_dims_vals, ir.IntegerType.get_signless(32))
+  ]
+  result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
+  if ctx.is_forward_compat():
+    fn = fn_base
+    scalar_layout = []
+    n = a_shape_vals[-1]
+    batch_size_val = hlo_s32(1)
+    for b_v in batch_dims_vals:
+      batch_size_val = hlo.multiply(batch_size_val, ensure_hlo_s32(b_v))
+    out = custom_call(
+      fn,
+      result_types=result_types,
+      operands=[hlo_s32(int(lower)), batch_size_val, ensure_hlo_s32(n), a],
+      operand_layouts=[scalar_layout] * 3 + [layout],
+      result_layouts=[layout, info_layout],
+      operand_output_aliases={3: 0},
+      result_shapes=result_shapes,
+  ).results
   else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
+    fn = fn_base + "_ffi"
+    out = custom_call(
+        fn,
+        result_types=result_types,
+        operands=[a],
+        operand_layouts=[layout],
+        result_layouts=[layout, info_layout],
+        operand_output_aliases={0: 0},
+        result_shapes=result_shapes,
+        backend_config={
+            "uplo": _matrix_uplo_attr(lower=lower),
+        },
+        api_version=4,
+    ).results
+  return out[:2]
+
+
+# # geev: Nonsymmetric eigendecomposition (eig)
+
+def geev_hlo(ctx, dtype, input, *,
+             input_shape_vals: tuple[DimensionSize, ...],  # input.shape as ir.Values
+             jobvl=True, jobvr=True):
+  # input_shape_vals are used for when input has dynamic shapes.
+  _lapack.initialize()
+  input_shape = ir.RankedTensorType(input.type).shape
+  assert len(input_shape) >= 2
+  n = input_shape_vals[-1]
+  batch_dims_vals = input_shape_vals[:-2]
+  num_bd = len(batch_dims_vals)
 
   layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(_constant_s32_scalar(c, int(lower)),
-              _constant_s32_scalar(c, b), _constant_s32_scalar(c, n), a),
-    shape_with_layout=Shape.tuple_shape((
-        Shape.array_shape(dtype, dims, layout),
-        Shape.array_shape(
-            np.dtype(np.int32), batch_dims, tuple(range(num_bd - 1, -1, -1))),
-    )),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(dtype, dims, layout),
-    ))
-  return tuple(_ops.GetTupleElement(out, i) for i in range(2))
 
+  compute_left = (
+      eig.ComputationMode.kComputeEigenvectors
+      if jobvl
+      else eig.ComputationMode.kNoEigenvectors
+  )
 
-# # ?gesdd: Singular value decomposition
+  compute_right = (
+      eig.ComputationMode.kComputeEigenvectors
+      if jobvr
+      else eig.ComputationMode.kNoEigenvectors
+  )
+  fn_base = build_lapack_fn_target(fn_base="geev", dtype=dtype)
 
-def gesdd(c, a, full_matrices=True, compute_uv=True):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
+  i32_type = ir.IntegerType.get_signless(32)
+  f32_type = ir.F32Type.get()
+  f64_type = ir.F64Type.get()
+  c64_type = ir.ComplexType.get(ir.F32Type.get())
+  c128_type = ir.ComplexType.get(ir.F64Type.get())
+  if ctx.is_forward_compat():
+    fn = fn_base
+    workspaces: list[ShapeTypePair]
+    eigvals: list[ShapeTypePair]
+    if dtype == np.float32:
+      real = True
+      eigvecs_type = c64_type
+      workspaces = [([n, n], f32_type)] * 3
+      workspace_layouts = [[0, 1]] * 3
+      eigvals = [(batch_dims_vals + (n,), f32_type)] * 2
+      eigvals_layouts = [tuple(range(num_bd, -1, -1))] * 2
+    elif dtype == np.float64:
+      real = True
+      eigvecs_type = c128_type
+      workspaces = [([n, n], f64_type)] * 3
+      workspace_layouts = [[0, 1]] * 3
+      eigvals = [(batch_dims_vals + (n,), f64_type)] * 2
+      eigvals_layouts = [tuple(range(num_bd, -1, -1))] * 2
+    elif dtype == np.complex64:
+      real = False
+      eigvecs_type = c64_type
+      workspaces = [([n, n], c64_type), ([hlo_add(n, n)], f32_type)]
+      workspace_layouts = [[0, 1], [0]]
+      eigvals = [(batch_dims_vals + (n,), c64_type)]
+      eigvals_layouts = [tuple(range(num_bd, -1, -1))]
+    elif dtype == np.complex128:
+      real = False
+      eigvecs_type = c128_type
+      workspaces = [([n, n], c128_type), ([hlo_add(n, n)], f64_type)]
+      workspace_layouts = [[0, 1], [0]]
+      eigvals = [(batch_dims_vals + (n,), c128_type)]
+      eigvals_layouts = [tuple(range(num_bd, -1, -1))]
+    else:
+      raise NotImplementedError(f"Unsupported dtype {dtype}")
 
-  if dtype == np.float32:
-    fn = b"lapack_sgesdd"
-    singular_vals_dtype = np.float32
-    lwork = _lapack.sgesdd_work_size(m, n, compute_uv, full_matrices)
-    workspace = (
-      Shape.array_shape(np.dtype(np.int32),
-                        (_lapack.gesdd_iwork_size(m, n),), (0,)),
-      Shape.array_shape(dtype, (lwork,), (0,)),
-    )
-  elif dtype == np.float64:
-    fn = b"lapack_dgesdd"
-    singular_vals_dtype = np.float64
-    lwork = _lapack.dgesdd_work_size(m, n, compute_uv, full_matrices)
-    workspace = (
-      Shape.array_shape(np.dtype(np.int32),
-                        (_lapack.gesdd_iwork_size(m, n),), (0,)),
-      Shape.array_shape(dtype, (lwork,), (0,)),
-    )
-  elif dtype == np.complex64:
-    fn = b"lapack_cgesdd"
-    singular_vals_dtype = np.float32
-    lwork = _lapack.cgesdd_work_size(m, n, compute_uv, full_matrices)
-    workspace = (
-      Shape.array_shape(np.dtype(np.int32), (_lapack.gesdd_iwork_size(m, n),),
-                        (0,)),
-      Shape.array_shape(np.dtype(np.float32),
-                        (_lapack.cgesdd_rwork_size(m, n, int(compute_uv)),),
-                        (0,)),
-      Shape.array_shape(dtype, (lwork,), (0,)),
-    )
-  elif dtype == np.complex128:
-    fn = b"lapack_zgesdd"
-    singular_vals_dtype = np.float64
-    lwork = _lapack.zgesdd_work_size(m, n, compute_uv, full_matrices)
-    workspace = (
-      Shape.array_shape(np.dtype(np.int32), (_lapack.gesdd_iwork_size(m, n),),
-                        (0,)),
-      Shape.array_shape(np.dtype(np.float64),
-                        (_lapack.cgesdd_rwork_size(m, n, int(compute_uv)),),
-                        (0,)),
-      Shape.array_shape(dtype, (lwork,), (0,)),
-    )
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
+    scalar_layout = []
+    info_layout = tuple(range(num_bd - 1, -1, -1))
 
-  scalar_layout = tuple(range(num_bd - 1, -1, -1))
-  vector_layout = (num_bd,) + scalar_layout
-  matrix_layout = (num_bd, num_bd + 1) + scalar_layout
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(_constant_s32_scalar(c, int(full_matrices)),
-              _constant_s32_scalar(c, int(compute_uv)),
-              _constant_s32_scalar(c, b),
-              _constant_s32_scalar(c, m), _constant_s32_scalar(c, n),
-              _constant_s32_scalar(c, lwork), a),
-    shape_with_layout=Shape.tuple_shape((
-        Shape.array_shape(dtype, batch_dims + (m, n), matrix_layout),
-        Shape.array_shape(np.dtype(singular_vals_dtype),
-                          batch_dims + (min(m, n),), vector_layout),
-        Shape.array_shape(dtype,
-                          batch_dims + (m, m if full_matrices else min(m, n)),
-                          matrix_layout),
-        Shape.array_shape(dtype,
-                          batch_dims + (n if full_matrices else min(m, n), n),
-                          matrix_layout),
-        Shape.array_shape(np.dtype(np.int32), batch_dims, scalar_layout),
-      ) + workspace
-    ),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(dtype, batch_dims + (m, n), matrix_layout),
-    ))
-  return (_ops.GetTupleElement(out, 1), _ops.GetTupleElement(out, 2),
-          _ops.GetTupleElement(out, 3), _ops.GetTupleElement(out, 4))
+    batch_size_val = hlo_s32(1)
+    for b_v in batch_dims_vals:
+      batch_size_val = hlo.multiply(batch_size_val, ensure_hlo_s32(b_v))
 
-
-# # syevd: Symmetric eigendecomposition
-
-def syevd(c, a, lower=False):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  assert m == n
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
-  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
-
-  if dtype == np.float32:
-    fn = b"lapack_ssyevd"
-    eigvals_type = np.float32
-    workspace = (Shape.array_shape(dtype, (_lapack.syevd_work_size(n),), (0,)),
-                 Shape.array_shape(np.dtype(np.int32),
-                                   (_lapack.syevd_iwork_size(n),), (0,)))
-  elif dtype == np.float64:
-    fn = b"lapack_dsyevd"
-    eigvals_type = np.float64
-    workspace = (Shape.array_shape(dtype, (_lapack.syevd_work_size(n),), (0,)),
-                 Shape.array_shape(np.dtype(np.int32),
-                                   (_lapack.syevd_iwork_size(n),), (0,)))
-  elif dtype == np.complex64:
-    fn = b"lapack_cheevd"
-    eigvals_type = np.float32
-    workspace = (Shape.array_shape(dtype, (_lapack.heevd_work_size(n),), (0,)),
-                 Shape.array_shape(np.dtype(np.float32),
-                                   (_lapack.heevd_rwork_size(n),), (0,)),
-                 Shape.array_shape(np.dtype(np.int32),
-                                   (_lapack.syevd_iwork_size(n),), (0,)))
-  elif dtype == np.complex128:
-    fn = b"lapack_zheevd"
-    eigvals_type = np.float64
-    workspace = (Shape.array_shape(dtype, (_lapack.heevd_work_size(n),), (0,)),
-                 Shape.array_shape(np.dtype(np.float64),
-                                   (_lapack.heevd_rwork_size(n),), (0,)),
-                 Shape.array_shape(np.dtype(np.int32),
-                                   (_lapack.syevd_iwork_size(n),), (0,)))
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(_constant_s32_scalar(c, 1 if lower else 0),
-              _constant_s32_scalar(c, b),
-              _constant_s32_scalar(c, n),
-              a),
-    shape_with_layout=Shape.tuple_shape((
-        Shape.array_shape(dtype, dims, layout),
-        Shape.array_shape(np.dtype(eigvals_type), batch_dims + (n,),
-                          tuple(range(num_bd, -1, -1))),
-        Shape.array_shape(np.dtype(np.int32), batch_dims,
-                          tuple(range(num_bd - 1, -1, -1))))
-        + workspace
-    ),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(dtype, dims, layout),
-    ))
-  return (_ops.GetTupleElement(out, 0), _ops.GetTupleElement(out, 1),
-          _ops.GetTupleElement(out, 2))
-
-
-# # geev: Nonsymmetric eigendecomposition
-
-def geev(c, a, jobvl=True, jobvr=True):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  assert m == n
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
-  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
-
-  jobvl_c = ord('V' if jobvl else 'N')
-  jobvr_c = ord('V' if jobvr else 'N')
-
-  if dtype == np.float32:
-    fn = b"lapack_sgeev"
-    real = True
-    eigvecs_type = np.complex64
-    workspaces = (Shape.array_shape(np.dtype(np.float32), (n, n), (0, 1)),
-                  Shape.array_shape(np.dtype(np.float32), (n, n), (0, 1)),
-                  Shape.array_shape(np.dtype(np.float32), (n, n), (0, 1)))
-    eigvals = (Shape.array_shape(np.dtype(np.float32), batch_dims + (n,),
-                                 tuple(range(num_bd, -1, -1))),
-               Shape.array_shape(np.dtype(np.float32), batch_dims + (n,),
-                                 tuple(range(num_bd, -1, -1))))
-  elif dtype == np.float64:
-    fn = b"lapack_dgeev"
-    real = True
-    eigvecs_type = np.complex128
-    workspaces = (Shape.array_shape(np.dtype(np.float64), (n, n), (0, 1)),
-                  Shape.array_shape(np.dtype(np.float64), (n, n), (0, 1)),
-                  Shape.array_shape(np.dtype(np.float64), (n, n), (0, 1)))
-    eigvals = (Shape.array_shape(np.dtype(np.float64), batch_dims + (n,),
-                                 tuple(range(num_bd, -1, -1))),
-               Shape.array_shape(np.dtype(np.float64), batch_dims + (n,),
-                                 tuple(range(num_bd, -1, -1))))
-  elif dtype == np.complex64:
-    fn = b"lapack_cgeev"
-    real = False
-    eigvecs_type = np.complex64
-    workspaces = (Shape.array_shape(np.dtype(np.complex64), (n, n), (0, 1)),
-                  Shape.array_shape(np.dtype(np.float32), (2 * n,), (0,)))
-    eigvals = (Shape.array_shape(np.dtype(np.complex64), batch_dims + (n,),
-                                 tuple(range(num_bd, -1, -1))),)
-  elif dtype == np.complex128:
-    fn = b"lapack_zgeev"
-    real = False
-    eigvecs_type = np.complex128
-    workspaces = (Shape.array_shape(np.dtype(np.complex128), (n, n), (0, 1)),
-                  Shape.array_shape(np.dtype(np.float64), (2 * n,), (0,)))
-    eigvals = (Shape.array_shape(np.dtype(np.complex128), batch_dims + (n,),
-                                 tuple(range(num_bd, -1, -1))),)
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
-
-  out = _ops.CustomCallWithLayout(
-    c, fn,
-    operands=(_constant_s32_scalar(c, b),
-              _constant_s32_scalar(c, n),
-              _ops.Constant(c, np.uint8(jobvl_c)),
-              _ops.Constant(c, np.uint8(jobvr_c)),
-              a),
-    shape_with_layout=Shape.tuple_shape(workspaces + eigvals + (
-        Shape.array_shape(np.dtype(eigvecs_type), dims, layout),
-        Shape.array_shape(np.dtype(eigvecs_type), dims, layout),
-        Shape.array_shape(np.dtype(np.int32), batch_dims,
-                          tuple(range(num_bd - 1, -1, -1))))
-    ),
-    operand_shapes_with_layout=(
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.int32), (), ()),
-        Shape.array_shape(np.dtype(np.uint8), (), ()),
-        Shape.array_shape(np.dtype(np.uint8), (), ()),
-        Shape.array_shape(dtype, dims, layout),
-    ))
+    shape_type_pairs: Sequence[ShapeTypePair] = workspaces + eigvals + [
+        (input_shape_vals, eigvecs_type),
+        (input_shape_vals, eigvecs_type),
+        (batch_dims_vals, i32_type)]
+    result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
+    out = custom_call(
+        fn,
+        result_types=result_types,
+        operands=[batch_size_val, ensure_hlo_s32(n),
+        hlo_u8(compute_left.value),
+        hlo_u8(compute_right.value),
+        input],
+        operand_layouts=[scalar_layout] * 4 + [layout],
+        result_layouts=(workspace_layouts + eigvals_layouts + [layout] * 2 +
+                        [info_layout]),
+        result_shapes=result_shapes,
+    ).results
+    if real:
+      return (hlo.complex(out[3], out[4]), out[5], out[6], out[7])
+    else:
+      return out[2:6]
+  fn = fn_base + "_ffi"
+  real = dtype == np.float32 or dtype == np.float64
+  eigvecs_type = (
+      c64_type if dtype == np.float32 or dtype == np.complex64 else c128_type
+  )
+  input_type = ir.RankedTensorType(input.type)
+  eigvals = [(batch_dims_vals + (n,), input_type.element_type)]
+  eigvals_layouts = [tuple(range(num_bd, -1, -1))]
   if real:
-    return (_ops.Complex(_ops.GetTupleElement(out, 3),
-                         _ops.GetTupleElement(out, 4)),
-            _ops.GetTupleElement(out, 5), _ops.GetTupleElement(out, 6),
-            _ops.GetTupleElement(out, 7))
+    eigvals = eigvals * 2
+    eigvals_layouts = eigvals_layouts * 2
+  info_layout = tuple(range(num_bd - 1, -1, -1))
+  shape_type_pairs: Sequence[ShapeTypePair] = [
+      *eigvals,
+      (input_shape_vals, eigvecs_type),
+      (input_shape_vals, eigvecs_type),
+      (batch_dims_vals, i32_type),
+  ]
+  result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
+  out = custom_call(
+      fn,
+      result_types=result_types,
+      operands=[input],
+      operand_layouts=[layout],
+      result_layouts=(
+          *eigvals_layouts,
+          layout,
+          layout,
+          info_layout,
+      ),
+      result_shapes=result_shapes,
+      backend_config={
+          "compute_left": _enum_to_char_attr(compute_left),
+          "compute_right": _enum_to_char_attr(compute_right),
+      },
+      api_version=4,
+  ).results
+  if real:
+    return (hlo.complex(out[0], out[1]), out[2], out[3], out[4])
   else:
-    return (_ops.GetTupleElement(out, 2), _ops.GetTupleElement(out, 3),
-            _ops.GetTupleElement(out, 4), _ops.GetTupleElement(out, 5))
+    return out[:4]
 
 # # gees : Schur factorization
 
-def gees(c, a, jobvs=True, sort=False, select=None):
-  a_shape = c.get_shape(a)
-  dtype = a_shape.element_type()
-  dims = a_shape.dimensions()
-  assert len(dims) >= 2
-  m, n = dims[-2:]
-  assert m == n
-  batch_dims = tuple(dims[:-2])
-  num_bd = len(batch_dims)
-  b = 1
-  for d in batch_dims:
-    b *= d
+def gees_hlo(ctx, dtype, a, *, jobvs=True, sort=False, select=None,
+             a_shape_vals: tuple[DimensionSize, ...]):
+  fn_base = prepare_lapack_call(fn_base="gees", dtype=dtype)
+  a_type = ir.RankedTensorType(a.type)
+  etype = a_type.element_type
+  assert len(a_shape_vals) >= 2
+  n = a_shape_vals[-1]
+  batch_dims_vals = a_shape_vals[:-2]
+  num_bd = len(batch_dims_vals)
   layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
 
   if sort:
     raise NotImplementedError(
         "The sort feature of LAPACK's gees routine is not implemented.")
 
-  jobvs = ord('V' if jobvs else 'N')
-  sort = ord('S' if sort else 'N')
+  mode = (
+      schur.ComputationMode.kComputeSchurVectors
+      if jobvs
+      else schur.ComputationMode.kNoComputeSchurVectors
+  )
+  sort = schur.Sort.kSortEigenvalues if sort else schur.Sort.kNoSortEigenvalues
+  if ctx.is_forward_compat():
+    fn = fn_base
+    workspaces: list[ShapeTypePair]
+    eigvals: list[ShapeTypePair]
+    if not np.issubdtype(dtype, np.complexfloating):
+      workspaces = [(a_shape_vals, etype)]
+      workspace_layouts = [layout]
+      eigvals = [(batch_dims_vals + (n,), etype)] * 2
+      eigvals_layouts = [tuple(range(num_bd, -1, -1))] * 2
+    else:
+      workspaces = [(a_shape_vals, etype),
+                    ([n], ir.ComplexType(etype).element_type),
+      ]
+      workspace_layouts = [layout, [0]]
+      eigvals = [(batch_dims_vals + (n,), etype)]
+      eigvals_layouts = [tuple(range(num_bd, -1, -1))]
 
-  if dtype == np.float32 or dtype == np.float64:
-    fn = b"lapack_sgees" if dtype == np.float32 else b"lapack_dgees"
-    schurvecs_type = dtype
-    workspaces = (Shape.array_shape(np.dtype(schurvecs_type), dims, layout),)
-    eigvals = (Shape.array_shape(
-        np.dtype(dtype), batch_dims + (n,), tuple(range(num_bd, -1, -1))),
-               Shape.array_shape(
-                   np.dtype(dtype), batch_dims + (n,),
-                   tuple(range(num_bd, -1, -1))))
-  elif dtype == np.complex64 or dtype == np.complex128:
-    fn = b"lapack_cgees" if dtype == np.complex64 else b"lapack_zgees"
-    schurvecs_type = dtype
-    workspaces = (
-        Shape.array_shape(np.dtype(schurvecs_type), dims, layout),
-        Shape.array_shape(
-            np.dtype(np.float32 if dtype == np.complex64 else np.float64),
-            (n,), (0,)))
-    eigvals = (Shape.array_shape(
-        np.dtype(dtype), batch_dims + (n,), tuple(range(num_bd, -1, -1))),)
-  else:
-    raise NotImplementedError("Unsupported dtype {}".format(dtype))
+    i32_type = ir.IntegerType.get_signless(32)
 
-  out = _ops.CustomCallWithLayout(
-      c,
+    scalar_layout = []
+    batch_size_val = hlo_s32(1)
+    for b_v in batch_dims_vals:
+      batch_size_val = hlo.multiply(batch_size_val, ensure_hlo_s32(b_v))
+    shape_type_pairs = workspaces + eigvals + [
+      (a_shape_vals, etype),
+      (batch_dims_vals, i32_type),
+      (batch_dims_vals, i32_type)]
+    result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
+    out = custom_call(
+        fn,
+        result_types=result_types,
+        operands=[
+            batch_size_val,
+            ensure_hlo_s32(n),
+            hlo_u8(mode.value),
+            hlo_u8(sort.value),
+            # TODO: figure out how to put the callable select function here
+            a
+        ],
+        operand_layouts=[scalar_layout] * 4 + [layout],
+        result_layouts=workspace_layouts + eigvals_layouts + [
+          layout,
+          tuple(range(num_bd - 1, -1, -1)),
+          tuple(range(num_bd - 1, -1, -1)),
+        ],
+        operand_output_aliases={4: 0},
+        result_shapes=result_shapes,
+    ).results
+    if sort == schur.Sort.kSortEigenvalues:
+      return (out[0], out[3], out[4], out[5])
+    else:
+      return (out[0], out[3], out[5])
+  fn = fn_base + "_ffi"
+  eigvals: list[ShapeTypePair]
+  is_complex = np.issubdtype(dtype, np.complexfloating)
+  eigvals = [(batch_dims_vals + (n,), etype)]
+  eigvals_layouts = [tuple(range(num_bd, -1, -1))]
+  if not is_complex:
+    eigvals = eigvals * 2
+    eigvals_layouts = eigvals_layouts * 2
+
+  i32_type = ir.IntegerType.get_signless(32)
+  shape_type_pairs = [
+      (a_shape_vals, etype),
+      (a_shape_vals, etype),
+      *eigvals,
+      (batch_dims_vals, i32_type),
+      (batch_dims_vals, i32_type),
+  ]
+  result_types, result_shapes = mk_result_types_and_shapes(shape_type_pairs)
+  out = custom_call(
       fn,
-      operands=(
-          _constant_s32_scalar(c, b),
-          _constant_s32_scalar(c, n),
-          _ops.Constant(c, np.uint8(jobvs)),
-          _ops.Constant(c, np.uint8(sort)),
-          #figure out how to put the callable select function here
-          a),
-      shape_with_layout=Shape.tuple_shape(workspaces + eigvals + (
-          Shape.array_shape(np.dtype(schurvecs_type), dims, layout),
-          Shape.array_shape(
-              np.dtype(np.int32), batch_dims, tuple(range(num_bd - 1, -1, -1))),
-          Shape.array_shape(
-              np.dtype(np.int32), batch_dims, tuple(range(num_bd -
-                                                          1, -1, -1))))),
-      operand_shapes_with_layout=(
-          Shape.array_shape(np.dtype(np.int32), (), ()),
-          Shape.array_shape(np.dtype(np.int32), (), ()),
-          Shape.array_shape(np.dtype(np.uint8), (), ()),
-          Shape.array_shape(np.dtype(np.uint8), (), ()),
-          Shape.array_shape(dtype, dims, layout),
-      ))
-  if sort == ord('S'):
-    return (_ops.GetTupleElement(out, 0), _ops.GetTupleElement(out, 3),
-            _ops.GetTupleElement(out, 4), _ops.GetTupleElement(out, 5))
+      result_types=result_types,
+      operands=[a],
+      # TODO(paruzelp): Use FFI execution context to put `select`
+      operand_layouts=[layout],
+      result_layouts=[
+          layout,
+          layout,
+          *eigvals_layouts,
+          tuple(range(num_bd - 1, -1, -1)),
+          tuple(range(num_bd - 1, -1, -1)),
+      ],
+      operand_output_aliases={0: 0},
+      result_shapes=result_shapes,
+      backend_config={
+          "mode": _enum_to_char_attr(mode),
+          "sort": _enum_to_char_attr(sort),
+      },
+      api_version=4,
+  ).results
+  # out: Schur Form, Schur Vectors, Eigenvalues, Selected Eigenvalues, Info
+  if is_complex:
+    return out[0], out[1], out[2], out[3], out[4]
   else:
-    return (_ops.GetTupleElement(out, 0), _ops.GetTupleElement(out, 3),
-            _ops.GetTupleElement(out, 5))
+    return out[0], out[1], (out[2], out[3]), out[4], out[5]
+
+
+# gehrd: Reduction of a non-symmetric square matrix to upper Hessenberg form.
+def gehrd_hlo(ctx, dtype, a):
+  fn_base = prepare_lapack_call(fn_base="gehrd", dtype=dtype)
+  a_type = ir.RankedTensorType(a.type)
+  dims = a_type.shape
+  assert len(dims) >= 2
+  m, n = dims[-2:]
+  assert m == n, (m, n)
+  batch_dims = tuple(dims[:-2])
+  num_bd = len(batch_dims)
+  if ctx.is_forward_compat():
+    fn = fn_base
+    b = 1
+    for d in batch_dims:
+      b *= d
+
+    if dtype == np.float32:
+      lwork = _lapack.lapack_sgehrd_workspace(n, n, 1, n)
+    elif dtype == np.float64:
+      lwork = _lapack.lapack_dgehrd_workspace(n, n, 1, n)
+    elif dtype == np.complex64:
+      lwork = _lapack.lapack_cgehrd_workspace(n, n, 1, n)
+    elif dtype == np.complex128:
+      lwork = _lapack.lapack_zgehrd_workspace(n, n, 1, n)
+    else:
+      raise NotImplementedError(f"Unsupported dtype {dtype}")
+
+    layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
+    i32_type = ir.IntegerType.get_signless(32)
+    return custom_call(
+        fn,
+        result_types=[
+          a.type,
+          ir.RankedTensorType.get(batch_dims + (n - 1,), a_type.element_type),
+          ir.RankedTensorType.get(batch_dims, i32_type),
+          ir.RankedTensorType.get([lwork], a_type.element_type),
+        ],
+        operands=[hlo_s32(n), hlo_s32(1), hlo_s32(n), hlo_s32(n), hlo_s32(b),
+        hlo_s32(lwork), a],
+        operand_layouts=[[]] * 6 + [layout],
+        result_layouts=[
+          layout,
+          (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+          tuple(range(num_bd - 1, -1, -1)),
+          [0],
+        ],
+        operand_output_aliases={6: 0},
+    ).results[:3]
+  fn = fn_base + "_ffi"
+  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
+  i32_type = ir.IntegerType.get_signless(32)
+  return custom_call(
+      fn,
+      result_types=[
+          a.type,
+          ir.RankedTensorType.get(batch_dims + (n - 1,), a_type.element_type),
+          ir.RankedTensorType.get(batch_dims, i32_type),
+      ],
+      operands=[a],
+      operand_layouts=[layout],
+      result_layouts=[
+          layout,
+          (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+          tuple(range(num_bd - 1, -1, -1)),
+      ],
+      operand_output_aliases={0: 0},
+      backend_config={
+          "low": _lapack_int_attr(1),
+          "high": _lapack_int_attr(n),
+      },
+      api_version=4,
+  ).results
+
+
+# sytrd: Reduction of a symmetric (Hermitian) matrix to tridiagonal form.
+def sytrd_hlo(ctx, dtype, a, *, lower):
+  fn_base = "he" if dtype == np.complex64 or dtype == np.complex128 else "sy"
+  fn_base = prepare_lapack_call(fn_base=fn_base + "trd", dtype=dtype)
+  a_type = ir.RankedTensorType(a.type)
+  dims = a_type.shape
+  assert len(dims) >= 2
+  m, n = dims[-2:]
+  assert m == n, (m, n)
+  batch_dims = tuple(dims[:-2])
+  num_bd = len(batch_dims)
+  layout = (num_bd, num_bd + 1) + tuple(range(num_bd - 1, -1, -1))
+  i32_type = ir.IntegerType.get_signless(32)
+
+  if ctx.is_forward_compat():
+    fn = fn_base
+    b = 1
+    for d in batch_dims:
+      b *= d
+
+    if dtype == np.float32:
+      lwork = _lapack.lapack_ssytrd_workspace(n, n)
+      diag_type = a_type.element_type
+    elif dtype == np.float64:
+      lwork = _lapack.lapack_dsytrd_workspace(n, n)
+      diag_type = a_type.element_type
+    elif dtype == np.complex64:
+      lwork = _lapack.lapack_chetrd_workspace(n, n)
+      diag_type = ir.F32Type.get()
+    elif dtype == np.complex128:
+      lwork = _lapack.lapack_zhetrd_workspace(n, n)
+      diag_type = ir.F64Type.get()
+    else:
+      raise NotImplementedError(f"Unsupported dtype {dtype}")
+
+    return custom_call(
+        fn,
+        result_types=[
+          a.type,
+          ir.RankedTensorType.get(batch_dims + (n,), diag_type),
+          ir.RankedTensorType.get(batch_dims + (n - 1,), diag_type),
+          ir.RankedTensorType.get(batch_dims + (n - 1,), a_type.element_type),
+          ir.RankedTensorType.get(batch_dims, i32_type),
+          ir.RankedTensorType.get([lwork], a_type.element_type),
+        ],
+        operands=[hlo_s32(n), hlo_s32(1 if lower else 0), hlo_s32(max(1, n)),
+        hlo_s32(b), hlo_s32(lwork), a],
+        operand_layouts=[[]] * 5 + [layout],
+        result_layouts=[
+          layout,
+          (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+          (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+          (num_bd,) + tuple(range(num_bd - 1, -1, -1)),
+          tuple(range(num_bd - 1, -1, -1)),
+          [0],
+        ],
+        operand_output_aliases={5: 0},
+    ).results[:5]
+  fn = fn_base + "_ffi"
+  if dtype == np.float32 or dtype == np.complex64:
+    diag_type = ir.F32Type.get()
+  elif dtype == np.float64 or dtype == np.complex128:
+    diag_type = ir.F64Type.get()
+  else:
+    raise NotImplementedError(f"Unsupported dtype {dtype}")
+
+  # Returns x_out, on_diag, off_diag, tau, info
+  return custom_call(
+      fn,
+      result_types=[
+          a.type,
+          ir.RankedTensorType.get(batch_dims + (n,), diag_type),
+          ir.RankedTensorType.get(batch_dims + (n - 1,), diag_type),
+          ir.RankedTensorType.get(batch_dims + (n - 1,), a_type.element_type),
+          ir.RankedTensorType.get(batch_dims, i32_type),
+      ],
+      operands=[a],
+      operand_layouts=[layout],
+      result_layouts=[
+          layout,
+          tuple(range(num_bd, -1, -1)),
+          tuple(range(num_bd, -1, -1)),
+          tuple(range(num_bd, -1, -1)),
+          tuple(range(num_bd - 1, -1, -1)),
+      ],
+      operand_output_aliases={0: 0},
+      backend_config={
+          "uplo": _matrix_uplo_attr(lower=lower),
+      },
+      api_version=4,
+  ).results
